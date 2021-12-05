@@ -108,6 +108,16 @@ static int create_rmt_window(rmt_item32_t * items, double sampling_window_second
     return num_items;
 }
 
+static uint32_t volatile DRAM_ATTR overflow_count[2];
+
+static IRAM_ATTR void pcnt_intr_handler(void *arg)
+{
+    uint32_t intr_status = PCNT.int_st.val;
+    overflow_count[0] += (intr_status & 0x01);
+    overflow_count[1] += ((intr_status & 0x02) >> 1);
+    PCNT.int_clr.val |= intr_status & 0x03;
+}
+
 static void init_pcnt(uint8_t pulse_gpio, uint8_t ctrl_gpio, pcnt_unit_t unit, pcnt_channel_t channel, uint16_t filter_length)
 {
     ESP_LOGD(TAG, "%s", __FUNCTION__);
@@ -133,7 +143,15 @@ static void init_pcnt(uint8_t pulse_gpio, uint8_t ctrl_gpio, pcnt_unit_t unit, p
 
     // enable counter filter - at 80MHz APB CLK, 1000 pulses is max 80,000 Hz, so ignore pulses less than 12.5 us.
     ESP_ERROR_CHECK(pcnt_set_filter_value(unit, filter_length));
-    ESP_ERROR_CHECK(pcnt_filter_enable(unit));
+    if (filter_length > 0) {
+        ESP_ERROR_CHECK(pcnt_filter_enable(unit));
+    } else {
+        ESP_ERROR_CHECK(pcnt_filter_disable(unit));
+    }
+    ESP_ERROR_CHECK(pcnt_event_enable(unit, PCNT_EVT_THRES_0));
+    pcnt_isr_handle_t isr_handle;
+    ESP_ERROR_CHECK(pcnt_isr_register(pcnt_intr_handler, NULL, 0, &isr_handle));
+    ESP_ERROR_CHECK(pcnt_intr_enable(unit));
 }
 
 void frequency_count_task_function(void * pvParameter)
@@ -157,7 +175,6 @@ void frequency_count_task_function(void * pvParameter)
         task_inputs->filter_length);
 
     init_rmt(task_inputs->rmt_gpio, task_inputs->rmt_channel, task_inputs->rmt_clk_div);
-    init_pcnt(task_inputs->pcnt_gpio, task_inputs->rmt_gpio, task_inputs->pcnt_unit, task_inputs->pcnt_channel, task_inputs->filter_length);
 
     // assuming 80MHz APB clock
     const double rmt_period = (double)(task_inputs->rmt_clk_div) / 80000000.0;
@@ -169,45 +186,42 @@ void frequency_count_task_function(void * pvParameter)
     int num_rmt_items = create_rmt_window(rmt_items, task_inputs->sampling_window_seconds, rmt_period);
     assert(num_rmt_items <= task_inputs->rmt_max_blocks * RMT_MEM_ITEM_NUM);
 
+    init_pcnt(task_inputs->pcnt_gpio, task_inputs->rmt_gpio, task_inputs->pcnt_unit, task_inputs->pcnt_channel, task_inputs->filter_length);
+
     TickType_t last_wake_time = xTaskGetTickCount();
     double frequency_hz;
 
-    while (1)
-    {
+    while (true) {
         // clear counter
         ESP_ERROR_CHECK(pcnt_counter_clear(task_inputs->pcnt_unit));
+
+        overflow_count[0] = 0;
 
         // start sampling window
         ESP_ERROR_CHECK(rmt_write_items(task_inputs->rmt_channel, rmt_items, num_rmt_items, false));
 
         // call wndow-start callback if set
-        if (task_inputs->window_start_callback)
-        {
+        if (task_inputs->window_start_callback) {
             (task_inputs->window_start_callback)();
         }
 
         // wait for window to finish
         ESP_ERROR_CHECK(rmt_wait_tx_done(task_inputs->rmt_channel, portMAX_DELAY));
 
-        // read counter
-        int16_t count = 0;
-        ESP_ERROR_CHECK(pcnt_get_counter_value(task_inputs->pcnt_unit, &count));
-
-        // TODO: check for overflow?
-
+        uint16_t counter_count = 0;
+        ESP_ERROR_CHECK(pcnt_get_counter_value(task_inputs->pcnt_unit, (int16_t*)&counter_count));
+        int32_t count = (int32_t)overflow_count[0] * 0x10000 + (int32_t)counter_count;
         frequency_hz = count / 2.0 / task_inputs->sampling_window_seconds;
 
         // call the frequency update callback
-        if (task_inputs->frequency_update_callback)
-        {
-            (task_inputs->frequency_update_callback)(frequency_hz);
+        if (task_inputs->frequency_update_callback) {
+            (task_inputs->frequency_update_callback)(count, frequency_hz);
         }
 
         ESP_LOGD(TAG, "counter %d, frequency %f Hz", count, frequency_hz);
 
         int delay_time = task_inputs->sampling_period_seconds * 1000 / portTICK_PERIOD_MS;
-        if (delay_time > 0)
-        {
+        if (delay_time > 0) {
             vTaskDelayUntil(&last_wake_time, delay_time);
         }
     }

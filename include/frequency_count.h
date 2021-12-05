@@ -69,7 +69,7 @@ typedef struct
     float sampling_window_seconds;          ///< sample window length (in seconds)
     uint16_t filter_length;                 ///< counter filter length in APB cycles
     void (*window_start_callback)(void);    ///< called just prior to starting a sampling window
-    void (*frequency_update_callback)(double hz);  ///< called each time a frequency is determined
+    void (*frequency_update_callback)(int32_t count, double hz);  ///< called each time a frequency is determined
 } frequency_count_configuration_t;
 
 /**
